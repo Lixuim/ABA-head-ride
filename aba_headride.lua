@@ -464,9 +464,163 @@ end)
 -- ===========================================================================
 -- UI
 -- ===========================================================================
+-- ===========================================================================
+-- settings persistence
+--
+-- Saved to C:\matcha\workspace\aba_headride.json. The enabled toggle is
+-- deliberately NOT saved - loading a config should never switch the ride on
+-- by itself. The keybind is not a UI.GetValue either: its value is the live
+-- key state, so the key and mode come off the widget via GetKey / GetType.
+-- ===========================================================================
+local HttpService = game:GetService("HttpService")
+local CFG_FILE    = "aba_headride.json"
+
+local DEFAULTS = {
+    ride_height = 4.0,  ride_pred  = 0.08, ride_range  = 150,
+    ride_mode   = 0,    ride_climb = 45.0, ride_gain   = 12.0,
+    ride_tick   = 2,    ride_hz    = 200,  ride_target = 0,
+    ride_lock   = true, ride_team  = false,
+    ride_marker = true, ride_tracer = false,
+}
+
+local CFG_ORDER = {
+    "ride_height", "ride_pred", "ride_range", "ride_mode", "ride_climb",
+    "ride_gain", "ride_tick", "ride_hz", "ride_target", "ride_lock",
+    "ride_team", "ride_marker", "ride_tracer",
+}
+
+local uiReady   = false
+local lastSaved = nil
+local cfgStatus = "not loaded"
+
+local function currentSettings()
+    local t = {}
+    for _, id in ipairs(CFG_ORDER) do
+        local v = gv(id, DEFAULTS[id])
+        local k = type(v)
+        if k == "boolean" or k == "number" or k == "string" then
+            t[id] = v
+        else
+            t[id] = DEFAULTS[id]
+        end
+    end
+
+    if rideKb then
+        local key  = safe(function() return rideKb:GetKey() end, nil)
+        local mode = safe(function() return rideKb:GetType() end, nil)
+        if tonumber(key) then t.kb_key = tonumber(key) end
+        if type(mode) == "string" then t.kb_type = mode end
+    end
+
+    -- colour picker hands back a Color3, which JSON cannot hold directly
+    local col = gv("ride_colour", nil)
+    if typeof and typeof(col) == "Color3" then
+        t.col_r = math.floor(((safe(function() return col.R end, 0) or 0)) * 255)
+        t.col_g = math.floor(((safe(function() return col.G end, 0) or 0)) * 255)
+        t.col_b = math.floor(((safe(function() return col.B end, 0) or 0)) * 255)
+    end
+
+    return t
+end
+
+local function saveSettings(announce)
+    local ok, json = pcall(function() return HttpService:JSONEncode(currentSettings()) end)
+    if not ok or not json or json == "" then
+        cfgStatus = "encode failed"
+        if announce then notify("Could not encode settings", "ABA", 4) end
+        return false
+    end
+    if json == lastSaved then return true end     -- nothing changed, skip the write
+    if pcall(writefile, CFG_FILE, json) then
+        lastSaved = json
+        cfgStatus = "saved"
+        if announce then notify("Settings saved", "ABA", 3) end
+        return true
+    end
+    cfgStatus = "write failed"
+    if announce then notify("Could not write " .. CFG_FILE, "ABA", 4) end
+    return false
+end
+
+local function applySettings(t)
+    for _, id in ipairs(CFG_ORDER) do
+        if t[id] ~= nil then pcall(UI.SetValue, id, t[id]) end
+    end
+    if rideKb then
+        if tonumber(t.kb_key) then
+            pcall(function() rideKb:SetKey(tonumber(t.kb_key)) end)
+        end
+        if type(t.kb_type) == "string" then
+            pcall(function() rideKb:SetType(t.kb_type) end)
+        end
+    end
+    if t.col_r and t.col_g and t.col_b then
+        pcall(function()
+            UI.SetValue("ride_colour", Color3.fromRGB(t.col_r, t.col_g, t.col_b))
+        end)
+    end
+end
+
+local function loadSettings(announce)
+    if not isfile(CFG_FILE) then
+        cfgStatus = "no file yet"
+        if announce then notify("No saved settings yet", "ABA", 3) end
+        return false
+    end
+    local okR, raw = pcall(readfile, CFG_FILE)
+    if not okR or not raw or raw == "" then
+        cfgStatus = "read failed"
+        if announce then notify("Could not read " .. CFG_FILE, "ABA", 4) end
+        return false
+    end
+    local okD, t = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not okD or type(t) ~= "table" then
+        cfgStatus = "file corrupt"
+        if announce then notify("Settings file is corrupt", "ABA", 5) end
+        return false
+    end
+    applySettings(t)
+    lastSaved = raw
+    cfgStatus = "loaded"
+    if announce then notify("Settings loaded", "ABA", 3) end
+    return true
+end
+
+local function resetSettings()
+    for _, id in ipairs(CFG_ORDER) do
+        pcall(UI.SetValue, id, DEFAULTS[id])
+    end
+    if rideKb then
+        pcall(function() rideKb:SetKey(0x39) end)
+        pcall(function() rideKb:SetType("hold") end)
+    end
+    lastSaved = nil
+    saveSettings(false)
+    cfgStatus = "reset"
+end
+
+-- Load once the tab has rendered (the widgets do not exist before that),
+-- then autosave in the background whenever something changes.
+task.spawn(function()
+    local waited = 0
+    while not uiReady and waited < 10 and not stale() do
+        wait(0.1)
+        waited = waited + 0.1
+    end
+    if stale() then return end
+    wait(0.25)
+    loadSettings(false)
+    while not stale() do
+        wait(2)
+        saveSettings(false)
+    end
+end)
+
 pcall(UI.RemoveTab, "ABA")   -- drop the previous run's tab before re-adding
 
 UI.AddTab("ABA", function(tab)
+    uiReady = true   -- widgets exist from here on, so a saved config can apply
+
     local ride = tab:Section("Head Ride", "Left")
     ride:Toggle("ride_on", "Enabled", false)
     rideKb = ride:Keybind("ride_kb", 0x39, "hold")   -- 0x39 = the 9 key
@@ -541,6 +695,17 @@ UI.AddTab("ABA", function(tab)
         currentTarget = nil
         hideDrawings()
         notify("Head ride off", "ABA", 3)
+    end)
+
+    local cfg = tab:Section("Settings", "Right")
+    cfg:Text("Config : " .. cfgStatus)
+    cfg:Text("File   : " .. CFG_FILE)
+    cfg:Tip("Saves itself every couple of seconds. The enabled toggle is never saved.")
+    cfg:Button("Save now", function() saveSettings(true) end)
+    cfg:Button("Reload from file", function() loadSettings(true) end)
+    cfg:Button("Reset to defaults", function()
+        resetSettings()
+        notify("Back to defaults", "ABA", 3)
     end)
 end)
 
